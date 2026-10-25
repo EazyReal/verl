@@ -88,7 +88,9 @@ def test_router_record_and_replay_use_dynamic_cp_size(monkeypatch):
     torch.testing.assert_close(target["indices"], torch.tensor([[1], [2]]))
 
 
-def test_r2_padding_is_distributed_before_sequence_parallel_scatter(monkeypatch):
+@pytest.mark.parametrize("quant_align_size", [None, 16, 32])
+@pytest.mark.parametrize("nested", [False, True])
+def test_r2_padding_is_distributed_before_sequence_parallel_scatter(monkeypatch, quant_align_size, nested):
     monkeypatch.setattr(router_utils.mpu, "get_tensor_model_parallel_world_size", lambda: 4)
     monkeypatch.setattr(router_utils.mpu, "get_context_parallel_world_size", lambda: 2)
     monkeypatch.setattr(router_utils.mpu, "get_context_parallel_rank", lambda: 0)
@@ -108,7 +110,9 @@ def test_r2_padding_is_distributed_before_sequence_parallel_scatter(monkeypatch)
     )
 
     valid_routes = torch.arange(9 * 8, dtype=torch.int16).reshape(9, 1, 8).remainder(64)
-    routes = _nested([valid_routes])
+    routes = _nested([valid_routes]) if nested else valid_routes.unsqueeze(0)
+    attention_mask = None if nested else torch.ones((1, 9), dtype=torch.bool)
+    monkeypatch.setattr(router_utils, "get_thd_quant_align_size", lambda _config: quant_align_size)
     config = SimpleNamespace(
         fp8=None,
         num_layers=1,
@@ -117,15 +121,19 @@ def test_r2_padding_is_distributed_before_sequence_parallel_scatter(monkeypatch)
         moe_layer_freq=1,
     )
 
-    router_utils.set_router_replay_data(routes, None, config, vp_rank=0)
+    router_utils.set_router_replay_data(routes, attention_mask, config, vp_rank=0)
 
     assert len(scattered) == 1
     pre_scatter = scattered[0]
-    assert pre_scatter.shape == (8, 1, 8)
-    torch.testing.assert_close(pre_scatter[:4], valid_routes[:4])
-    padding = pre_scatter[4:, 0]
+    num_rows = 8 if quant_align_size is None else 1024
+    assert pre_scatter.shape == (num_rows, 1, 8)
+    num_valid = 4 if quant_align_size is None else 9
+    torch.testing.assert_close(pre_scatter[:num_valid], valid_routes[:num_valid])
+    padding = pre_scatter[num_valid:, 0]
     rank_load = torch.bincount((padding // 2).flatten(), minlength=32)
-    torch.testing.assert_close(rank_load, torch.ones(32, dtype=torch.int64))
+    assert rank_load.sum() == (num_rows - num_valid) * 8
+    assert rank_load.max() - rank_load.min() <= 1
+    assert (padding.sort(dim=-1).values.diff(dim=-1) != 0).all()
     torch.testing.assert_close(target["indices"], pre_scatter[:, 0].to(torch.int64))
 
 
@@ -174,3 +182,42 @@ def test_pp_gather_normalizes_nested_routes_to_cpu(monkeypatch):
     assert routes.device.type == "cpu"
     assert routes.dtype == torch.int16
     assert [part.tolist() for part in routes.unbind()] == [[[[1], [3]], [[2], [4]]]]
+
+
+def test_pp_gather_supports_zero_layer_bshd_stage(monkeypatch):
+    local = torch.empty((1, 3, 0, 2), dtype=torch.int16)
+    remote = torch.arange(12, dtype=torch.int16).reshape(1, 3, 2, 2)
+    collective_calls = []
+
+    monkeypatch.setattr(router_utils, "device_name", "cpu")
+    monkeypatch.setattr(router_utils.mpu, "get_pipeline_model_parallel_group", lambda: object())
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda _group: 2)
+
+    def fake_all_gather(tensor_list, tensor, group, async_op=False):
+        collective_calls.append((tuple(tensor.shape), async_op))
+        if tensor.numel() == 1:
+            tensor_list[0].fill_(0)
+            tensor_list[1].fill_(2)
+            return
+        tensor_list[0].zero_()
+        tensor_list[1].copy_(remote.contiguous().view(torch.uint8))
+
+    monkeypatch.setattr(torch.distributed, "all_gather", fake_all_gather)
+    config = SimpleNamespace(pipeline_model_parallel_size=2, virtual_pipeline_model_parallel_size=None)
+
+    routes = router_utils.pp_gather(local, config)
+
+    assert collective_calls == [((1,), False), ((1, 3, 2, 4), False)]
+    assert routes.shape == remote.shape
+    torch.testing.assert_close(routes, remote)
+
+
+def test_reorder_and_merge_vpp_layers_keeps_dense_chunk_placeholder(monkeypatch):
+    empty_chunk = torch.empty((1, 3, 0, 2), dtype=torch.int16)
+    moe_chunk = torch.arange(6, dtype=torch.int16).reshape(1, 3, 1, 2)
+    monkeypatch.setattr(router_utils, "get_schedule_table", lambda *_args: [(0, 0), (0, 1)])
+
+    routes = router_utils.reorder_and_merge_vpp_layers([empty_chunk, moe_chunk], 1, 2, 1)
+
+    assert routes.shape == moe_chunk.shape
+    torch.testing.assert_close(routes, moe_chunk)
