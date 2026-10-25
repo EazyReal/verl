@@ -22,7 +22,6 @@ from verl.trainer.config import CheckpointConfig, RolloutCorrectionConfig
 from verl.utils.profiler.config import ProfilerConfig
 from verl.utils.qat import QATConfig
 
-from .checkpoint import McoreCheckpointConfig
 from .engine import (
     FSDPEngineConfig,
     McoreEngineConfig,
@@ -136,7 +135,6 @@ class ActorConfig(BaseConfig):
         optim (OptimizerConfig): Configuration for optimizer.
         use_fused_kernels (bool): Whether to use custom fused kernels (e.g., FlashAttention, fused MLP).
         data_loader_seed (int): Seed for data loader. If None, uses global seed.
-        router_replay (RouterReplayConfig): Configuration for router replay in MoE models.
     """
 
     _mutable_fields = BaseConfig._mutable_fields | {
@@ -185,7 +183,6 @@ class ActorConfig(BaseConfig):
     engine: BaseConfig = field(default_factory=BaseConfig)
     rollout_n: int = MISSING  # must be override by sampling config
     model_config: HFModelConfig = field(default_factory=BaseConfig)
-    router_replay: RouterReplayConfig = field(default_factory=RouterReplayConfig)
 
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size
@@ -269,8 +266,6 @@ class McoreActorConfig(ActorConfig):
         strategy (str): Training strategy set to 'megatron' for Megatron parallelism.
         megatron (dict[str, Any]): Configuration for Megatron parallelism settings.
         profile (dict[str, Any]): Configuration for profiling settings.
-        checkpoint (McoreCheckpointConfig): Megatron-specific checkpoint config
-            that adds ``mbridge_config`` on top of the base checkpoint fields.
     """
 
     strategy: str = "megatron"
@@ -279,7 +274,7 @@ class McoreActorConfig(ActorConfig):
     megatron: McoreEngineConfig = field(default_factory=McoreEngineConfig)
     profile: dict[str, Any] = field(default_factory=dict)
     use_rollout_log_probs: bool = False
-    checkpoint: McoreCheckpointConfig = field(default_factory=McoreCheckpointConfig)
+    checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
     def __post_init__(self):
         """Validate FSDP actor configuration parameters."""
