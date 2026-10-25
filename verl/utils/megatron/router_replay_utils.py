@@ -506,6 +506,9 @@ def set_router_replay_data(
             else None
         )
 
+        # Redistributing padding under capacity limits can displace valid-token routes.
+        # Keep the existing zero-filled padding routes for capacity-limited MoE.
+        balance_padding = replay_mask is None and getattr(tf_config, "moe_expert_capacity_factor", None) is None
         valid_rows_rmpad = None
         replay_mask_rmpad = None
         if layers_topk_idx.is_nested:
@@ -517,7 +520,7 @@ def set_router_replay_data(
                 local_cp_size=local_cp_size,
                 cp_layout=cp_layout,
             )
-            if replay_mask is None:
+            if balance_padding:
                 valid_rows = torch.nested.nested_tensor_from_jagged(
                     torch.ones(
                         layers_topk_idx.values().shape[0],
@@ -549,7 +552,7 @@ def set_router_replay_data(
             layers_topk_idx_rmpad, _ = preprocess_packed_seqs(
                 layers_topk_idx, attention_mask, pre_process=True, quant_align_size=quant_align_size
             )
-            if replay_mask is None:
+            if balance_padding:
                 valid_rows_rmpad, _ = preprocess_packed_seqs(
                     attention_mask.bool(), attention_mask, pre_process=True, quant_align_size=quant_align_size
                 )

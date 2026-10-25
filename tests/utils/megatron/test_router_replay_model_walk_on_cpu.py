@@ -183,3 +183,30 @@ def test_padding_routes_preserve_valid_rows_and_balance_experts(
         expert_load = torch.bincount(layer_routes.flatten(), minlength=num_experts)
         assert rank_load.max() - rank_load.min() <= 1
         assert expert_load.max() - expert_load.min() <= 1
+
+
+@pytest.mark.parametrize("capacity_factor", [None, 0.5, 1.0])
+def test_padding_balance_preserves_capacity_limited_routes(orphans_then_model, tf_config, monkeypatch, capacity_factor):
+    """Capacity-limited replay must retain the original zero-filled padding routes."""
+    _, model = orphans_then_model
+    tf_config.moe_expert_capacity_factor = capacity_factor
+    routes = torch.ones((1, NUM_TOKENS, NUM_LAYERS, TOPK), dtype=torch.int64)
+    attention_mask = torch.ones((1, NUM_TOKENS), dtype=torch.bool)
+
+    def preprocess(tensor, _mask, **_kwargs):
+        padded = tensor.new_zeros((1, NUM_TOKENS + 1, *tensor.shape[2:]))
+        padded[:, :NUM_TOKENS] = tensor
+        return padded, None
+
+    monkeypatch.setattr(router_replay_utils, "preprocess_packed_seqs", preprocess)
+    router_replay_utils.set_router_replay_data(routes, attention_mask, tf_config, model=model)
+
+    for router in _routers(model):
+        torch.testing.assert_close(
+            router.target_topk_idx[:NUM_TOKENS], torch.ones((NUM_TOKENS, TOPK), dtype=torch.int64)
+        )
+        padding = router.target_topk_idx[-1]
+        if capacity_factor is None:
+            assert padding.unique().numel() == TOPK
+        else:
+            assert torch.count_nonzero(padding) == 0

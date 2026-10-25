@@ -88,9 +88,11 @@ def test_router_record_and_replay_use_dynamic_cp_size(monkeypatch):
     torch.testing.assert_close(target["indices"], torch.tensor([[1], [2]]))
 
 
+@pytest.mark.parametrize("capacity_factor", [None, 0.5, 1.0])
 @pytest.mark.parametrize("quant_align_size", [None, 16, 32])
 @pytest.mark.parametrize("nested", [False, True])
-def test_r2_padding_is_distributed_before_sequence_parallel_scatter(monkeypatch, quant_align_size, nested):
+def test_r2_padding_before_sequence_parallel_scatter(monkeypatch, quant_align_size, nested, capacity_factor):
+    """Balance dropless padding while preserving capacity-limited routes exactly."""
     monkeypatch.setattr(router_utils.mpu, "get_tensor_model_parallel_world_size", lambda: 4)
     monkeypatch.setattr(router_utils.mpu, "get_context_parallel_world_size", lambda: 2)
     monkeypatch.setattr(router_utils.mpu, "get_context_parallel_rank", lambda: 0)
@@ -119,6 +121,7 @@ def test_r2_padding_is_distributed_before_sequence_parallel_scatter(monkeypatch,
         num_moe_experts=64,
         expert_model_parallel_size=32,
         moe_layer_freq=1,
+        moe_expert_capacity_factor=capacity_factor,
     )
 
     router_utils.set_router_replay_data(routes, attention_mask, config, vp_rank=0)
@@ -130,10 +133,18 @@ def test_r2_padding_is_distributed_before_sequence_parallel_scatter(monkeypatch,
     num_valid = 4 if quant_align_size is None else 9
     torch.testing.assert_close(pre_scatter[:num_valid], valid_routes[:num_valid])
     padding = pre_scatter[num_valid:, 0]
-    rank_load = torch.bincount((padding // 2).flatten(), minlength=32)
-    assert rank_load.sum() == (num_rows - num_valid) * 8
-    assert rank_load.max() - rank_load.min() <= 1
-    assert (padding.sort(dim=-1).values.diff(dim=-1) != 0).all()
+    if capacity_factor is None:
+        rank_load = torch.bincount((padding // 2).flatten(), minlength=32)
+        assert rank_load.sum() == (num_rows - num_valid) * 8
+        assert rank_load.max() - rank_load.min() <= 1
+        assert (padding.sort(dim=-1).values.diff(dim=-1) != 0).all()
+    else:
+        # Exact pre-change dispatch input: both token-dropping policies and
+        # pad-to-capacity receive the same routes and scores as before.
+        expected = torch.zeros_like(pre_scatter)
+        expected[:num_valid] = valid_routes[:num_valid]
+        torch.testing.assert_close(pre_scatter, expected)
+    assert target["mask"] is None
     torch.testing.assert_close(target["indices"], pre_scatter[:, 0].to(torch.int64))
 
 
