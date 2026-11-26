@@ -17,9 +17,35 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 import torch
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _vocab_parallel_embedding_stubs():
+    """Stubs standing in for vLLM's ``VocabParallelEmbedding``, or {} if vLLM is real.
+
+    ``weight_update_utils`` imports that class at module scope for tied-alias
+    detection, so loading it on CPU needs a placeholder. This file only exercises
+    the buffer helpers, which never touch it.
+    """
+    try:
+        importlib.import_module("vllm.model_executor.layers.vocab_parallel_embedding")
+    except ImportError:
+        pass
+    else:
+        return {}
+
+    names = [
+        "vllm",
+        "vllm.model_executor",
+        "vllm.model_executor.layers",
+        "vllm.model_executor.layers.vocab_parallel_embedding",
+    ]
+    stubs = {name: sys.modules.get(name) or types.ModuleType(name) for name in names}
+    stubs[names[-1]].VocabParallelEmbedding = type("VocabParallelEmbedding", (), {})
+    return stubs
 
 
 def _load_weight_update_utils():
@@ -27,7 +53,18 @@ def _load_weight_update_utils():
     spec = importlib.util.spec_from_file_location("weight_update_utils", module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec is not None and spec.loader is not None
-    spec.loader.exec_module(module)
+
+    stubs = _vocab_parallel_embedding_stubs()
+    saved = {name: sys.modules.get(name) for name in stubs}
+    try:
+        sys.modules.update(stubs)
+        spec.loader.exec_module(module)
+    finally:
+        for name, prev in saved.items():
+            if prev is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = prev
     return module
 
 
@@ -78,8 +115,16 @@ def _load_vllm_rollout_utils():
 
     fake_vllm_quant = types.ModuleType("verl.utils.vllm.vllm_quant_utils")
     fake_vllm_quant.apply_vllm_quant_patches = lambda: None
-    fake_vllm_quant.is_fp8_model = lambda config: False
-    fake_vllm_quant.load_quanted_weights = lambda weights, runner, is_drafter=False: weights
+    fake_vllm_quant.configure_fp8_ignored_layers_match_mode = lambda config: None
+    fake_vllm_quant.is_quantized_model = lambda config: False
+    fake_vllm_quant.refresh_rocm_attention_weight_caches = lambda model: None
+    fake_vllm_quant.reset_uncalibrated_kv_cache_scales = lambda model: None
+
+    fake_rocm_expert_map = types.ModuleType("verl.utils.vllm.rocm_vllm_moe_expert_map")
+    fake_rocm_expert_map.restore_moe_expert_maps = lambda model: None
+
+    fake_bucketed_transfer = types.ModuleType("verl.workers.rollout.vllm_rollout.bucketed_weight_transfer")
+    fake_bucketed_transfer.BucketedWeightReceiver = None
 
     # NOTE: deliberately do NOT stub verl.plugin.platform. It is lightweight and
     # imports fine on CPU. verl.utils.device binds `get_platform` at import time, so
@@ -95,6 +140,8 @@ def _load_vllm_rollout_utils():
         "verl.utils.vllm": fake_vllm_utils,
         "verl.utils.vllm.patch": fake_vllm_patch,
         "verl.utils.vllm.vllm_quant_utils": fake_vllm_quant,
+        "verl.utils.vllm.rocm_vllm_moe_expert_map": fake_rocm_expert_map,
+        "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer": fake_bucketed_transfer,
         "verl.workers.rollout.vllm_rollout.weight_update_utils": _weight_update_utils,
     }
 
@@ -217,8 +264,9 @@ def test_vllm_update_weights_loads_params_and_buffers():
     )
 
 
-def test_vllm_update_weights_syncs_buffers_to_mtp_drafter():
-    """When an MTP drafter is synced, its registered buffers must be updated too."""
+@pytest.mark.parametrize("owner_attr", ["drafter", "speculator"])
+def test_vllm_update_weights_syncs_buffers_to_mtp_drafter(owner_attr):
+    """MTP buffers must stay in sync with either the V1 or V2 draft-model owner."""
     main_model = _ToyModel()
     drafter_model = _ToyModel()
     main_model.load_weights = lambda weights: None
@@ -234,7 +282,7 @@ def test_vllm_update_weights_syncs_buffers_to_mtp_drafter():
 
     worker = object.__new__(vLLMColocateWorkerExtension)
     worker.model_runner = _FakeModelRunner(main_model, speculative_config=_SpecConfig())
-    worker.model_runner.drafter = _Drafter(drafter_model)
+    setattr(worker.model_runner, owner_attr, _Drafter(drafter_model))
 
     weights = [
         ("model.layers.0.linear.weight", torch.ones(4, 4, dtype=torch.float32)),
@@ -246,3 +294,44 @@ def test_vllm_update_weights_syncs_buffers_to_mtp_drafter():
     expected = torch.tensor([5, 6, 7, 8], dtype=torch.float32)
     torch.testing.assert_close(main_model.model.layers[0].e_score_correction_bias, expected)
     torch.testing.assert_close(drafter_model.model.layers[0].e_score_correction_bias, expected)
+
+
+@pytest.mark.parametrize("fail_receive", [False, True])
+def test_bucketed_transfer_is_bracketed_by_vllm_reload(monkeypatch, fail_receive):
+    events = []
+    _install_fake_reload(monkeypatch, events)
+
+    class Receiver:
+        def __init__(self, **kwargs):
+            pass
+
+        def receive_weights(self, on_bucket_received):
+            on_bucket_received([], False)
+            if fail_receive:
+                raise RuntimeError("transfer failed")
+            on_bucket_received([], True)
+
+    monkeypatch.setattr(_vllm_rollout_utils, "BucketedWeightReceiver", Receiver)
+    worker = object.__new__(vLLMColocateWorkerExtension)
+    worker.device = torch.device("cpu")
+    worker.model_runner = _FakeModelRunner(_ToyModel())
+    monkeypatch.setattr(worker, "_iter_all_models", lambda: [None])
+    monkeypatch.setattr(worker, "_iter_all_models_with_config", lambda: [(None, None)])
+    monkeypatch.setattr(worker, "_get_zmq_handle", lambda: "unused")
+    monkeypatch.setattr(worker, "_update_weights", lambda *args, **kwargs: events.append("bucket"))
+
+    if fail_receive:
+        with pytest.raises(RuntimeError, match="transfer failed"):
+            worker.update_weights_from_ipc()
+        assert events == ["start_reload", "bucket"]
+    else:
+        worker.update_weights_from_ipc()
+        assert events == ["start_reload", "bucket", "bucket", "finish_reload"]
+
+
+def _install_fake_reload(monkeypatch, events):
+    """Record vLLM's reload lifecycle calls (start_reload / finish_reload)."""
+    reload = types.ModuleType("vllm.model_executor.model_loader.reload")
+    reload.start_reload = lambda model: events.append("start_reload")
+    reload.finish_reload = lambda model, model_config, device: events.append("finish_reload")
+    monkeypatch.setitem(sys.modules, reload.__name__, reload)

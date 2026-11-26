@@ -311,7 +311,8 @@ class SFTTrainer:
                 if self.config.trainer.balance_batch:
                     global_seqlen_lst = torch.Tensor([item.size()[0] for item in data["input_ids"]])
                     global_seqlen_lst = calculate_workload(global_seqlen_lst)
-                    dp_size = max(self.training_client._query_dispatch_info("train")) + 1
+                    dispatch_infos = self.training_client._query_dispatch_info("train")
+                    dp_size = max(info.dp_rank for info in dispatch_infos) + 1
 
                     global_partition_lst = get_seqlen_balanced_partitions(
                         global_seqlen_lst, k_partitions=dp_size, equal_size=True
@@ -344,7 +345,7 @@ class SFTTrainer:
                 metrics["train/grad_norm"] = metrics.pop("grad_norm")
                 metrics["train/lr"] = metrics.pop("lr")
                 metrics["train/mfu"] = metrics.pop("mfu")
-                metrics["train/global_tokens"] = torch.sum(torch.tensor(batch_seqlens, device=self.device_name)).item()
+                metrics["train/global_tokens"] = sum(batch_seqlens)
                 total_tokens += metrics["train/global_tokens"]
                 metrics["train/total_tokens(B)"] = total_tokens / 1e9
                 tracking.log(data=metrics, step=global_step)
@@ -364,7 +365,7 @@ class SFTTrainer:
                         metrics = tu.get(output, "metrics")
                         val_losses.append(metrics["loss"])
 
-                    val_loss = torch.mean(torch.tensor(val_losses, device=self.device_name))
+                    val_loss = torch.mean(torch.tensor(val_losses))
 
                     metric = {"val/loss": val_loss.detach().item()}
                     tracking.log(data=metric, step=global_step)

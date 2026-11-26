@@ -45,9 +45,14 @@ class DistillationLossConfig(BaseConfig):
     log_prob_min_clamp (float, optional):
         Minimum value to clamp log probabilities for stability, e.g., log q - log p where p or q are
         very close to zero. If None, no clamping is applied.
+    tail_mass_eps (float):
+        Minimum student probability mass assigned to the aggregate tail bucket for
+        ``forward_kl_topk_tail`` numerical stability.
     use_policy_gradient (bool):
         Whether to incorporate distillation loss as a reward, as done
-        by https://thinkingmachines.ai/blog/on-policy-distillation/. Recommended to use loss_mode=k1.
+        by https://thinkingmachines.ai/blog/on-policy-distillation/. Use loss_mode=k1 or kl for
+        reverse-KL policy gradients. The non-negative single-token losses abs, mse, k2, k3,
+        and low_var_kl are rejected in this mode.
         Otherwise, distillation loss is directly backpropagated as a supervised loss,
         as in https://arxiv.org/abs/2306.13649. Recommended to use loss_mode=k3 or forward_kl_topk.
     policy_loss_mode (str):
@@ -68,9 +73,10 @@ class DistillationLossConfig(BaseConfig):
     distillation_loss_coef: float = 1.0
     loss_max_clamp: Optional[float] = 10.0
     log_prob_min_clamp: Optional[float] = -10.0
+    tail_mass_eps: float = 1e-6
 
     # Chunked top-K log-probs (opt-in, avoids [B, T, V] log_softmax buffer
-    # at long context). Only consumed by ``loss_mode='forward_kl_topk'``.
+    # at long context). Consumed by teacher-top-k forward KL loss modes.
     # Default ``False`` to preserve short-context performance (chunked path
     # has ~6x time overhead at N=14K, V=152K). Set ``True`` when hitting OOM
     # at long context (>=64K tokens, V=152K) where the baseline path OOMs.
@@ -81,7 +87,7 @@ class DistillationLossConfig(BaseConfig):
     # overhead (saved-tensor total stays constant either way).
     chunked_topk_chunk_size: int = 4096
 
-    use_policy_gradient: bool = True
+    use_policy_gradient: bool = False
     policy_loss_mode: str = "vanilla"
     clip_ratio: float = 0.2
     clip_ratio_low: float = 0.2
@@ -98,6 +104,7 @@ class DistillationLossConfig(BaseConfig):
     loss_settings: Optional[dict] = None
 
     def __post_init__(self):
+        """Resolve the loss settings and validate the selected update mode."""
         self._mutable_fields.add("loss_settings")
         from verl.trainer.distillation.losses import DistillationLossSettings, get_distillation_loss_settings
 
@@ -109,19 +116,35 @@ class DistillationLossConfig(BaseConfig):
                 f"but got {self.policy_loss_mode}."
             )
 
-        if self.use_policy_gradient and self.loss_mode == "forward_kl_topk":
+        if self.use_policy_gradient and self.loss_settings.use_topk:
             print(
-                "WARNING: forward_kl_topk is most effective as a supervised distillation loss "
+                f"WARNING: {self.loss_mode} is most effective as a supervised distillation loss "
                 "(use_policy_gradient=False). With policy gradient, the update uses only the sampled"
                 " token's logprob ∇logπ(a), so the top-k distributional signal (how non-sampled logits "
                 "should move) is largely unused."
             )
 
-        if not self.use_policy_gradient and self.loss_mode == "k1":
+        if self.use_policy_gradient and self.loss_mode in ("abs", "mse", "k2", "k3", "low_var_kl"):
             raise ValueError(
-                "Directly backpropagating k1 loss is incorrect since gradient of k1 loss"
-                " wrt model weights does not depend on teacher log probabilities."
+                f"Using {self.loss_mode} with use_policy_gradient=True does not give the reverse-KL policy gradient. "
+                "Use loss_mode='k1' or 'kl' for reverse-KL policy-gradient distillation."
             )
+
+        if not self.use_policy_gradient and self.loss_mode in ("k1", "kl"):
+            raise ValueError(
+                f"Directly backpropagating {self.loss_mode} loss is incorrect since its gradient"
+                " wrt model weights does not depend on teacher log probabilities."
+                " Set use_policy_gradient=True for k1 or kl."
+            )
+
+        if self.loss_mode == "forward_kl_topk_tail":
+            if self.log_prob_min_clamp is not None:
+                raise ValueError(
+                    "forward_kl_topk_tail requires log_prob_min_clamp=None. Clamping individual top-k "
+                    "log probabilities changes their probability mass and breaks the coarse-grained KL definition."
+                )
+            if not 0.0 < self.tail_mass_eps < 1.0:
+                raise ValueError(f"tail_mass_eps must be in (0, 1), but got {self.tail_mass_eps}.")
 
 
 @dataclass

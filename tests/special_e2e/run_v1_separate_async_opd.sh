@@ -84,7 +84,6 @@ fi
 
 params=(
     model_engine=megatron
-    trainer.use_v1=True
     trainer.v1.trainer_mode=separate_async
     trainer.v1.separate_async.num_warmup_batches=1
     trainer.v1.separate_async.parameter_sync_step=${PARAMETER_SYNC_STEP}
@@ -128,10 +127,8 @@ params=(
     actor_rollout_ref.actor.clip_ratio_c=10.0
     actor_rollout_ref.actor.use_kl_loss=False
     actor_rollout_ref.actor.kl_loss_coef=0.0
-    actor_rollout_ref.actor.megatron.vanilla_mbridge=False
     actor_rollout_ref.actor.megatron.param_offload=False
     actor_rollout_ref.actor.megatron.optimizer_offload=False
-    actor_rollout_ref.actor.megatron.grad_offload=False
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${TRAIN_TP}
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${TRAIN_PP}
     actor_rollout_ref.rollout.name=vllm

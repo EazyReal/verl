@@ -13,7 +13,7 @@
 # limitations under the License.
 import asyncio
 import logging
-import os
+import uuid
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -23,6 +23,7 @@ from omegaconf import DictConfig
 from pydantic import BaseModel
 from ray.actor import ActorHandle
 
+from verl.plugin.platform import get_platform
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup, ResourcePoolManager
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_device_name
@@ -30,10 +31,23 @@ from verl.workers.config import HFModelConfig, RolloutConfig
 
 logger = logging.getLogger(__file__)
 
+# Shared by every replica this process creates, and fresh per run, so a cache entry left in an
+# external KV store by an earlier run never matches even when it reaches the same global step.
+_PREFIX_CACHE_NAMESPACE = uuid.uuid4().hex
 
-# Max number of concurrent calls to the methods of Rollout,
-# excluding calls to generate method.
-CONTROL_METHOD_CONCURRENCY = 16
+
+def prefix_cache_salt(config: RolloutConfig, global_steps: Optional[int]) -> Optional[str]:
+    """Engine cache_salt for a request served by weights of ``global_steps``.
+
+    None under ``external_kv_cache_invalidation="reset"``, where verl resets caches instead.
+    The server computes the salt after its pause gate, so a request parked across a weight
+    update is salted with the weights it actually runs on.
+    """
+    if config.external_kv_cache_invalidation != "salt":
+        return None
+    # Set by RolloutReplica; without it, salts from different runs would collide in a shared store.
+    assert config.prefix_cache_namespace, "prefix_cache_namespace is unset; servers must be launched by RolloutReplica"
+    return f"{config.prefix_cache_namespace}:{global_steps}"
 
 
 class TokenOutput(BaseModel):
@@ -44,7 +58,7 @@ class TokenOutput(BaseModel):
     routed_experts: Optional[Any] = None
     """routed experts of response token ids"""
     stop_reason: Optional[str] = None
-    """stop reason: 'completed', 'aborted', or None for unknown"""
+    """stop reason: 'completed', 'length', 'aborted', or None for unknown"""
     num_preempted: Optional[int] = None
     """number of preempted times for metric calculation"""
     extra_fields: dict[str, Any] = {}
@@ -102,6 +116,8 @@ class RolloutReplica(ABC):
     ) -> None:
         self.replica_rank = replica_rank
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
+        if self.config.prefix_cache_namespace is None:
+            self.config.prefix_cache_namespace = _PREFIX_CACHE_NAMESPACE
         self.model_config: HFModelConfig = model_config
 
         self.world_size = (
@@ -186,26 +202,34 @@ class RolloutReplica(ABC):
         self.workers = worker_group.workers
         await self.launch_servers()
 
-    async def init_standalone(self):
-        """Init standalone rollout server, create new resource pool for this rollout."""
-        # create resource pool for this rollout
+    async def init_standalone(self, resource_pool: Optional[RayResourcePool] = None):
+        """Init standalone rollout server.
+
+        Args:
+            resource_pool: Existing pool to attach. If omitted, create a new
+                per-replica pool as before. Callers that already sliced a parent
+                pool (e.g. async-RL) pass the slice here so replica placement
+                stays under their ResourcePoolManager.
+        """
         self.rollout_mode = RolloutMode.STANDALONE
-        if self.is_reward_model:
-            resource_pool_name = f"rollout_pool_reward_{self.replica_rank}{self.name_suffix}"
-        elif self.is_teacher_model:
-            resource_pool_name = f"rollout_pool_teacher_{self.replica_rank}{self.name_suffix}"
-        else:
-            resource_pool_name = f"rollout_pool_{self.replica_rank}{self.name_suffix}"
-        resource_pool_spec = {
-            resource_pool_name: [self.gpus_per_replica_node] * self.nnodes,
-        }
-        resource_pool_manager = ResourcePoolManager(
-            resource_pool_spec=resource_pool_spec,
-            mapping=None,
-            max_colocate_count=2,
-        )
-        resource_pool_manager.create_resource_pool()
-        self.resource_pool = resource_pool_manager.resource_pool_dict[resource_pool_name]
+        if resource_pool is None:
+            if self.is_reward_model:
+                resource_pool_name = f"rollout_pool_reward_{self.replica_rank}{self.name_suffix}"
+            elif self.is_teacher_model:
+                resource_pool_name = f"rollout_pool_teacher_{self.replica_rank}{self.name_suffix}"
+            else:
+                resource_pool_name = f"rollout_pool_{self.replica_rank}{self.name_suffix}"
+            resource_pool_spec = {
+                resource_pool_name: [self.gpus_per_replica_node] * self.nnodes,
+            }
+            resource_pool_manager = ResourcePoolManager(
+                resource_pool_spec=resource_pool_spec,
+                mapping=None,
+                max_colocate_count=2,
+            )
+            resource_pool_manager.create_resource_pool()
+            resource_pool = resource_pool_manager.resource_pool_dict[resource_pool_name]
+        self.resource_pool = resource_pool
 
         # create worker group for this rollout
         if self.is_reward_model:
@@ -214,12 +238,14 @@ class RolloutReplica(ABC):
             name_prefix = f"rollout_teacher_standalone_{self.replica_rank}{self.name_suffix}"
         else:
             name_prefix = f"rollout_standalone_{self.replica_rank}{self.name_suffix}"
+        # These workers share each bundle's device with the rollout engine's own workers. Where a
+        # device cannot be shared between processes (TPU), they must not claim it.
         worker_group = RayWorkerGroup(
             resource_pool=self.resource_pool,
             ray_cls_with_init=self.get_ray_class_with_init_args(),
             bin_pack=False,
             name_prefix=name_prefix,
-            use_gpu=True,
+            use_gpu=get_platform().supports_colocated_worker_groups(),
             device_name=get_device_name(),
         )
         self.workers = worker_group.workers
@@ -253,12 +279,6 @@ class RolloutReplica(ABC):
         """Get rollout server handle for Token-in-token-out generation."""
         return self._server_handle
 
-    @property
-    def max_concurrency(self) -> int:
-        # 1000 is Ray's default max_concurrency for async execution.
-        # Add some margin to account for control method call.
-        return max(1000, self.config.max_num_seqs + CONTROL_METHOD_CONCURRENCY)
-
     def rollout_worker_use_gpu(self) -> bool:
         return True
 
@@ -270,9 +290,19 @@ class RolloutReplica(ABC):
         """Sleep each rollout server."""
         await asyncio.gather(*[server.sleep.remote() for server in self.servers])
 
-    async def abort_all_requests(self):
-        """Partial rollout: abort and save all unfinished requests in each rollout server."""
-        await asyncio.gather(*[server.abort_all_requests.remote() for server in self.servers])
+    async def abort_all_requests(self, reject_request: bool = False):
+        """Partial rollout: abort and save all unfinished requests in each rollout server.
+
+        Args:
+            reject_request: Fail requests that arrive while generation is blocked instead
+                of holding them until the next resume_generation(). Pass True when the
+                replica is leaving the load balancer and no resume is coming soon.
+                Backends that cannot intercept their own admission path log a warning
+                and ignore it.
+        """
+        await asyncio.gather(
+            *[server.abort_all_requests.remote(reject_request=reject_request) for server in self.servers]
+        )
 
     async def resume_generation(self):
         """Resume generation on all servers after abort_all_requests."""
@@ -325,8 +355,6 @@ def _load_vllm():
 
 
 def _load_sglang():
-    os.environ["SGLANG_USE_CPU_ENGINE"] = "1"
-
     try:
         import vllm  # noqa: F401
     except ImportError:
@@ -364,7 +392,6 @@ def _load_sglang():
 
     from verl.workers.rollout.sglang_rollout.async_sglang_server import SGLangReplica
 
-    del os.environ["SGLANG_USE_CPU_ENGINE"]
     return SGLangReplica
 
 

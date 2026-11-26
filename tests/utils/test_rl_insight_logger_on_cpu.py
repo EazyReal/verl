@@ -28,16 +28,20 @@ def _reset_rl_insight_logger():
     RLInsightLogger._init_done = False
     RLInsightLogger._rl_insight_module = None
     RLInsightLogger._registered_metrics.clear()
+    RLInsightLogger._warned_unsupported_features.clear()
     yield
     RLInsightLogger._init_done = False
     RLInsightLogger._rl_insight_module = None
     RLInsightLogger._registered_metrics.clear()
+    RLInsightLogger._warned_unsupported_features.clear()
 
 
 @pytest.fixture
 def mock_rl_insight(monkeypatch):
     module = MagicMock()
     module.metric_gauge = MagicMock()
+    # Released 0.3.0 has no metric_log. MagicMock would otherwise invent one.
+    module.metric_log = None
 
     @contextmanager
     def _trace_state(*args, **kwargs):
@@ -99,6 +103,69 @@ def test_log_lazy_inits_and_writes_gauge(monkeypatch, mock_rl_insight):
     assert RLInsightLogger._init_done is True
 
 
+def test_log_uses_metric_log_with_step_when_available(monkeypatch, mock_rl_insight):
+    monkeypatch.setenv(RLInsightLogger.ENABLE_ENV, "1")
+    mock_rl_insight.metric_log = MagicMock()
+
+    RLInsightLogger.log({"actor/pg_loss": 0.12, "bad": object()}, step=100)
+
+    mock_rl_insight.metric_log.assert_called_once_with("actor/pg_loss", 0.12, step=100)
+    mock_rl_insight.metric_gauge.assert_not_called()
+
+
+def test_trace_state_decorator_resolves_callable_lane(monkeypatch, mock_rl_insight):
+    monkeypatch.setenv(RLInsightLogger.ENABLE_ENV, "1")
+
+    class Worker:
+        rank = 2
+
+        @RLInsightLogger.trace_state_decorator("update_weight", state_lane_id=lambda self: f"rank_{self.rank}")
+        async def update_weights(self):
+            return "ok"
+
+    assert asyncio.run(Worker().update_weights()) == "ok"
+    mock_rl_insight.trace_state.assert_called_once_with("update_weight", state_lane_id="rank_2")
+
+
+def test_trace_state_decorator_passes_literal_lane(monkeypatch, mock_rl_insight):
+    monkeypatch.setenv(RLInsightLogger.ENABLE_ENV, "1")
+
+    class Server:
+        @RLInsightLogger.trace_state_decorator("sleep", state_lane_id="actor_0")
+        async def sleep(self):
+            return None
+
+    asyncio.run(Server().sleep())
+    mock_rl_insight.trace_state.assert_called_once_with("sleep", state_lane_id="actor_0")
+
+
+def test_trace_state_decorator_skips_trace_when_disabled(monkeypatch, mock_rl_insight):
+    monkeypatch.delenv(RLInsightLogger.ENABLE_ENV, raising=False)
+    lane_called = False
+
+    def lane_id(self):
+        nonlocal lane_called
+        lane_called = True
+        return "actor_0"
+
+    class Server:
+        @RLInsightLogger.trace_state_decorator("wake_up", state_lane_id=lane_id)
+        async def wake_up(self):
+            return "ok"
+
+    assert asyncio.run(Server().wake_up()) == "ok"
+    assert lane_called is False
+    mock_rl_insight.trace_state.assert_not_called()
+
+
+def test_trace_state_decorator_rejects_sync_method():
+    with pytest.raises(TypeError, match="async methods"):
+
+        @RLInsightLogger.trace_state_decorator("sleep")
+        def sleep(self):
+            return None
+
+
 def test_trace_state_lazy_inits_once_under_concurrent_async_tasks(monkeypatch, mock_rl_insight):
     monkeypatch.setenv(RLInsightLogger.ENABLE_ENV, "1")
 
@@ -130,3 +197,38 @@ def test_register_metrics_dedups_and_finish_resets(monkeypatch, mock_rl_insight)
     mock_rl_insight.finish.assert_called_once_with()
     assert RLInsightLogger._init_done is False
     assert not RLInsightLogger._registered_metrics
+
+
+def test_trace_span_warns_and_noops_with_old_rl_insight(monkeypatch, mock_rl_insight, caplog):
+    monkeypatch.setenv(RLInsightLogger.ENABLE_ENV, "1")
+    mock_rl_insight.__version__ = "0.2.1"
+    mock_rl_insight.trace_span = None
+
+    with caplog.at_level("WARNING", logger="verl.utils.tracking"):
+        RLInsightLogger.trace_span("agent_task", start_time_ns=1, end_time_ns=2)
+
+    assert "RL-Insight does not support trace_span" in caplog.text
+    mock_rl_insight.init.assert_not_called()
+
+
+def test_agent_loop_session_falls_back_with_old_rl_insight(monkeypatch, mock_rl_insight, caplog):
+    from verl.utils.rollout_trace import RolloutTraceConfig
+
+    monkeypatch.setenv(RLInsightLogger.ENABLE_ENV, "1")
+    mock_rl_insight.__version__ = "0.2.1"
+    RolloutTraceConfig.reset()
+    RolloutTraceConfig.init(project_name="project", experiment_name="experiment", backend=None)
+
+    with caplog.at_level("WARNING", logger="verl.utils.tracking"):
+        session = RLInsightLogger.agent_loop_session(
+            sample=7,
+            session=1,
+            uid="uid",
+            global_steps=3,
+            session_id="session-id",
+        )
+
+    assert session.identity["state_lane_id"] == "experiment=experiment/sample=7/session=1/traj=0"
+    assert session.identity["global_steps"] == 3
+    session.finish(status="success", trajectories=[])
+    assert "RL-Insight does not support agent_loop_session" in caplog.text

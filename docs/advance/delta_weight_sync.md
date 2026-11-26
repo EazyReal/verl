@@ -1,6 +1,6 @@
 # Delta Weight Sync
 
-Last updated: 07/10/2026.
+Last updated: 08/23/2026.
 
 ## Motivation
 
@@ -87,13 +87,12 @@ checkpoint engine (including the V1 ``separate_async`` trainer).
 - **Transport**: the sparse payload is broadcast over the existing NCCL collective group in
   bucket-sized flushes (streamed: each flush is sent and freed as it is produced, so sender peak
   memory stays ~2 buckets regardless of model size).
-- **Apply**: each rollout worker hands its local copy of the sparse payload to its colocated SGLang
-  TP worker via same-GPU ``update_weights_from_tensor`` IPC, where a verl-shipped loader —
-  registered automatically through SGLang's stock ``--custom-weight-loader`` hook, so **no SGLang
-  fork or patch is needed** — verifies the flush checksum (fail loud), densifies each parameter's
-  delta into a NaN-masked tensor, and overwrites only the changed positions *in place* on the live
-  weights. No full-model mirror is staged anywhere on the rollout side: receiver peak memory is one
-  bucket plus one decode chunk, independent of model size.
+- **Apply**: with SGLang, each rollout worker forwards its local copy over same-GPU IPC to a
+  VERL loader registered through the stock ``--custom-weight-loader`` hook (no SGLang patch
+  needed), verifying the checksum and updating live weights without keeping a full rollout-model
+  copy. With vLLM, use ``checkpoint_engine.backend=vllm_sparse_nccl``, which broadcasts sparse
+  patches directly from the trainer to vLLM's native ``SparseNCCLWeightTransferEngine`` without
+  a rollout-side IPC hop or custom vLLM adapter.
 - **Seeding**: the first sync is an explicit **dense** pass — the raw weights stream through the same
   bucketed wire with no positions attached (values only), populating the trainer-side snapshot as they
   go — so a dummy-initialized rollout gets a correct base without any sparse-encoding overhead.
@@ -195,13 +194,18 @@ Correctness evidence (details in the PR):
 
 ## Usage
 
-A runnable example is ``verl/experimental/one_step_off_policy/shell/grpo_0.6b_gsm8k_fsdp2_sglang_delta_sharded_2_6.sh`` —
-the SGLang 2+6 disaggregated GRPO recipe with ``backend=delta_sharded``.
+The [SGLang 2+6 disaggregated GRPO example](https://github.com/verl-project/verl-recipe/tree/main/one_step_off_policy/shell/grpo_0.6b_gsm8k_fsdp2_sglang_delta_sharded_2_6.sh)
+uses ``backend=delta_sharded`` and is pinned to verl v0.9.1.
+Follow its [recipe setup](https://github.com/verl-project/verl-recipe/tree/main/one_step_off_policy/README.md#required-verl-version)
+and run from the pinned verl checkout with that recipe revision at ``recipe/``.
 
-Current scope: disaggregated (``hybrid_engine=False``) + SGLang rollout in BF16, FSDP1/FSDP2/TorchTitan
-training engines.
-Selecting a delta backend with any other rollout engine raises ``NotImplementedError`` at worker startup;
-a per-backend apply interface (vllm/trt-llm plugins) is planned.
+Current scope is disaggregated (``hybrid_engine=False``) BF16 rollout. The
+producer side supports FSDP1, FSDP2, and TorchTitan training engines.
+``checkpoint_engine.backend=delta_sharded`` targets SGLang; for vLLM, use
+``checkpoint_engine.backend=vllm_sparse_nccl`` (vLLM's native ``sparse_nccl``
+weight transfer backend, alongside ``vllm_ipc``, ``vllm_nccl``,
+``vllm_sharded_rdt``, and ``vllm_nccl_m2n``). Selecting any other rollout engine
+with ``delta_sharded`` raises ``NotImplementedError`` at worker startup.
 
 ## Roadmap
 

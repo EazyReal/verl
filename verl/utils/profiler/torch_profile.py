@@ -13,15 +13,21 @@
 # limitations under the License.
 
 import functools
+import logging
 import os
 import re
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
 import torch
 
-from .config import ProfilerConfig, TorchProfilerToolConfig
+from verl.plugin.platform import get_platform
+
+from .config import DEVICE_ACTIVITIES, DEVICE_CONTENTS, ProfilerConfig, TorchProfilerToolConfig
 from .profile import DistProfiler
+
+logger = logging.getLogger(__name__)
 
 
 def get_dist_topology() -> dict:
@@ -109,6 +115,12 @@ def build_trace_basename(
     return "_".join(parts)
 
 
+def _call_platform_hook(platform, name: str, **kwargs):
+    """Call an optional platform hook; None if the platform has none."""
+    hook = getattr(platform, name, None)
+    return hook(**kwargs) if callable(hook) else None
+
+
 def get_torch_profiler(
     contents: list[str],
     save_path: str,
@@ -122,10 +134,11 @@ def get_torch_profiler(
     """Build a ``torch.profiler.profile`` instance.
 
     Args:
-        contents: Selects the other ``torch.profiler.profile`` arguments -- ``cuda`` maps to
-            ``activities``, ``shapes`` to ``record_shapes``, ``memory`` to ``profile_memory`` and
-            ``stack`` to ``with_stack``. CPU activity is always on, since verl's per-stage
-            ``record_function`` markers are CPU-side events.
+        contents: Selects the other ``torch.profiler.profile`` arguments -- the active platform's
+            device type (``cuda`` on NVIDIA and ROCm) maps to ``activities``, ``shapes`` to
+            ``record_shapes``, ``memory`` to ``profile_memory`` and ``stack`` to ``with_stack``.
+            CPU activity is always on, since verl's per-stage ``record_function`` markers are
+            CPU-side events.
         save_path: Directory to write chrome traces to.
         role: Optional logical scope name (e.g. ``train`` for a worker's whole-step window, or
             a stage name in discrete mode), embedded in the filename.
@@ -196,8 +209,33 @@ def get_torch_profiler(
     # record_function, and those markers -- like operator names -- are CPU-side events, so a
     # device-only trace would be bare kernels that cannot be attributed to any stage.
     activities = [torch.profiler.ProfilerActivity.CPU]
-    if not contents or "cuda" in contents:
-        activities.append(torch.profiler.ProfilerActivity.CUDA)
+    # The platform's own device type is both the activity to record and the `contents` keyword that
+    # asks for it, so no per-backend branch is needed: NVIDIA/ROCm resolve "cuda" exactly as before,
+    # and a device torch cannot profile resolves to nothing.
+    platform = get_platform()
+    device = platform.device_name
+    # A platform may name its activity (e.g. PrivateUse1); otherwise use torch's for the device.
+    device_activity = _call_platform_hook(platform, "torch_profiler_activity")
+    if not isinstance(device_activity, torch.profiler.ProfilerActivity):
+        device_activity = DEVICE_ACTIVITIES.get(device)
+    device_requested = not contents or device in contents
+    if device_requested and device_activity is not None:
+        activities.append(device_activity)
+    elif device_requested and device != "cpu":
+        logger.warning(
+            "torch.profiler has no activity for device '%s', so the trace holds CPU events only. "
+            "If this platform has its own profiler, select it with global_profiler.tool instead.",
+            device,
+        )
+    elif ignored := sorted((contents & DEVICE_CONTENTS) - {device, "cpu"}):
+        # A keyword valid for *a* backend but not this one, e.g. a CUDA config run elsewhere.
+        logger.warning(
+            "profiler contents selects device activity %s, but this platform's device is '%s': "
+            "no device activity is recorded. Use '%s', or leave contents empty.",
+            ignored,
+            device,
+            device,
+        )
 
     profile_kwargs = dict(
         activities=activities,
@@ -206,6 +244,11 @@ def get_torch_profiler(
         profile_memory="memory" in contents,
         on_trace_ready=_trace_handler,
     )
+    # Platform-specific profiler kwargs, e.g. an experimental_config for a device trace.
+    if device_activity is not None and device_requested:
+        extra_kwargs = _call_platform_hook(platform, "torch_profiler_kwargs", save_path=save_path, rank=rank)
+        if isinstance(extra_kwargs, Mapping):
+            profile_kwargs.update(extra_kwargs)
     # With a schedule the caller drives prof.step() per mini-batch to walk the
     # skip_first/wait/warmup/active/repeat state machine; without one, collection runs
     # continuously from start() to stop().

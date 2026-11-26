@@ -160,6 +160,14 @@ class BaseEngine:
         """
         raise NotImplementedError
 
+    def set_rollout_weight_quantizer(self, quantizer) -> None:
+        """Make :meth:`get_per_tensor_param` emit weights quantized by ``quantizer`` for a low-precision rollout.
+
+        Args:
+            quantizer: Callable mapping an iterable of ``(name, tensor)`` HF weights to the quantized stream.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support trainer-side rollout quantization")
+
     def get_per_tensor_param_shard(self, **kwargs) -> tuple[Generator, Optional[dict]]:
         """
         Like :meth:`get_per_tensor_param`, but yields each rank's *local* parameter shard
@@ -289,6 +297,13 @@ class BaseEngine:
         Whether the current rank is the first rank in model parallel group that contains model outputs
         """
         raise NotImplementedError
+
+    def is_mp_src_rank(self):
+        """Whether this rank receives data before worker-side model-parallel dispatch.
+
+        Engines may override this when the input source rank differs from the rank that owns outputs.
+        """
+        return self.is_mp_src_rank_with_outputs()
 
     def disable_adapter(self) -> ContextManager:
         """

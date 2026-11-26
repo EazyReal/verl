@@ -34,8 +34,8 @@ from verl.utils.profiler import (
     rollout_profiler_global_ranks,
 )
 from verl.workers.config import HFModelConfig, RolloutConfig
-from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
-from verl.workers.rollout.utils import get_max_position_embeddings, qwen2_5_vl_dedup_image_tokens, run_uvicorn
+from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput, prefix_cache_salt
+from verl.workers.rollout.utils import dedup_image_tokens, get_max_position_embeddings, run_uvicorn
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
@@ -135,6 +135,8 @@ class TRTLLMHttpServer:
         # Set when generation is allowed; cleared during weight sync to block new requests.
         self._generation_allowed = asyncio.Event()
         self._generation_allowed.set()
+        # Set by abort_all_requests(reject_request=True) when no resume is coming soon.
+        self._rejecting = False
 
         self.profiler_controller = self._init_profiler_controller()
 
@@ -204,20 +206,8 @@ class TRTLLMHttpServer:
 
         per_worker_gpu_share = 1.0 / self.max_colocate_count
 
-        quantization = self.config.quantization
-        if quantization is not None:
-            if quantization == "fp8":
-                FP8_BLOCK_QUANT_KWARGS = {
-                    "activation_scheme": "dynamic",
-                    "fmt": "e4m3",
-                    "quant_method": "fp8",
-                    "weight_block_size": [128, 128],
-                }
-                engine_kwargs["model_kwargs"] = {"quantization_config": FP8_BLOCK_QUANT_KWARGS}
-                if self.config.load_format != "dummy":
-                    raise ValueError("FP8 quantization is only supported for dummy load format")
-            else:
-                raise ValueError(f"Currently only support fp8 quantization, got: {quantization}")
+        if self.config.quantization.enabled:
+            raise NotImplementedError("rollout.quantization is only supported by vLLM")
 
         llm_kwargs = {
             "model": self.model_config.local_path,
@@ -322,6 +312,7 @@ class TRTLLMHttpServer:
         video_data: Optional[list[Any]] = None,
         audio_data: Optional[list[Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        session_id: Optional[str] = None,
     ) -> TokenOutput:
         from tensorrt_llm.llmapi import SamplingParams
 
@@ -345,9 +336,14 @@ class TRTLLMHttpServer:
         if audio_data is not None:
             raise NotImplementedError("TRT-LLM rollout does not support audio inputs yet.")
 
-        await self._generation_allowed.wait()
+        rejected = await self._park_until_allowed(request_id)
+        if rejected is not None:
+            return rejected
+        cache_salt = prefix_cache_salt(self.config, self.global_steps)
+        # Only pass it when set, so "reset" keeps working on TRT-LLM releases without cache_salt.
+        salt_kwargs = {"cache_salt": cache_salt} if cache_salt is not None else {}
         if self.is_vlm_model and (image_data or video_data):
-            deduped_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
+            deduped_ids = dedup_image_tokens(prompt_ids, self.model_config.processor)
             org_prompt = self.llm.tokenizer.decode(deduped_ids)
             input_dict = {
                 "prompt": org_prompt,
@@ -362,11 +358,13 @@ class TRTLLMHttpServer:
             outputs = await self.llm.generate_async(
                 inputs=input_dict,
                 sampling_params=trt_llm_sampling_params,
+                **salt_kwargs,
             )
         else:
             outputs = await self.llm.generate_async(
                 inputs=prompt_ids,
                 sampling_params=trt_llm_sampling_params,
+                **salt_kwargs,
             )
         token_ids = outputs.outputs[0].token_ids
         log_probs = None
@@ -388,9 +386,16 @@ class TRTLLMHttpServer:
         """Set the global steps of the model weights."""
         self.global_steps = global_steps
 
-    async def abort_all_requests(self):
-        """Abort all in-flight requests and block new ones. Call resume_generation() to unblock."""
+    async def abort_all_requests(self, reject_request: bool = False):
+        """Abort all in-flight requests and block new ones. Call resume_generation() to unblock.
+
+        Args:
+            reject_request: Fail requests that arrive while generation is blocked instead of
+                holding them. Pass True when this server is leaving the load balancer with no
+                resume coming soon, so the client re-routes them to an active replica.
+        """
         self._generation_allowed.clear()
+        self._rejecting = reject_request
         await self.llm.pause_generation()
         # TODO: remove once TRT-LLM is upgraded to a version where pause_generation()
         # drains internally (https://github.com/NVIDIA/TensorRT-LLM/pull/13784).
@@ -401,7 +406,26 @@ class TRTLLMHttpServer:
     async def resume_generation(self):
         """Unblock new generation requests after abort_all_requests()."""
         await self.llm.resume_generation()
+        self._rejecting = False
         self._generation_allowed.set()
+
+    async def _park_until_allowed(self, request_id: str) -> Optional[TokenOutput]:
+        """Wait out a blocked gate, or fail the request when the gate rejects late arrivals.
+
+        Returns None once generation is allowed, or an aborted TokenOutput telling the client
+        to re-route. Rejection is checked before waiting, so the request never reaches the engine.
+        """
+        while not self._generation_allowed.is_set():
+            if self._rejecting:
+                logger.debug("rejecting request %s: server left rotation while generation is blocked", request_id)
+                return TokenOutput(
+                    token_ids=[],
+                    log_probs=None,
+                    stop_reason="aborted",
+                    extra_fields={"global_steps": self.global_steps},
+                )
+            await self._generation_allowed.wait()
+        return None
 
     async def clear_kv_cache(self):
         """Invalidate prefix cache entries after weight update."""
@@ -622,7 +646,7 @@ class TRTLLMReplica(RolloutReplica):
             ),
             runtime_env={"env_vars": _server_env_vars},
             name=name,
-            max_concurrency=self.max_concurrency,
+            max_concurrency=self.config.ray_actor_max_concurrency,
         ).remote(
             config=self.config,
             model_config=self.model_config,

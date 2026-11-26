@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import functools
 import logging
 import os
@@ -31,22 +32,28 @@ from verl.checkpoint_engine import CheckpointEngineRegistry
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
+from verl.trainer.ppo.score_centering import score_centering_ppo_loss
 from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_device_name, get_torch_device, set_expandable_segments
 from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.import_utils import import_external_libs
+from verl.utils.megatron.low_precision import bf16_layers_at_start_end
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.metric.utils import Metric
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage
 from verl.utils.py_functional import append_to_dict
+from verl.utils.qat import dispatch_rollout_weight_quantizer
+from verl.utils.real_nvfp4 import real_nvfp4_enabled
 from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
 from verl.utils.torch_functional import allgather_dict_into_dict
+from verl.utils.tracking import RLInsightLogger
 from verl.workers.config import (
     ActorConfig,
     DistillationConfig,
     HFModelConfig,
+    McoreEngineConfig,
     MtpConfig,
     RolloutConfig,
     TrainingWorkerConfig,
@@ -56,6 +63,35 @@ from verl.workers.utils.losses import ppo_loss
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _plan_liger_flsce_capacity(config: DictConfig, role: str) -> Optional[tuple[int, int]]:
+    """Reserve all colocated consumers before the reference engine initializes Liger."""
+    if not (config.model.get("use_liger", False) and config.model.get("use_fused_kernels", False)):
+        return None
+    tokens = []
+    tp_sizes = []
+    for consumer in ("actor", "ref"):
+        if consumer not in role:
+            continue
+        settings = config[consumer]
+        if settings.strategy != "megatron":
+            continue
+        engine = settings.megatron
+        if engine.get("dtype", "bfloat16") != "bfloat16":
+            continue
+        limits = (
+            (settings.ppo_max_token_len_per_gpu, config.rollout.log_prob_max_token_len_per_gpu)
+            if consumer == "actor"
+            else (settings.log_prob_max_token_len_per_gpu,)
+        )
+        tokens.extend(limit * engine.context_parallel_size for limit in limits if limit is not None)
+        tp_sizes.append(engine.tensor_model_parallel_size)
+    if not tp_sizes:
+        return None
+    if not tokens:
+        raise ValueError("Liger requires existing max-token limits for its colocated Megatron consumers")
+    return max(tokens), min(tp_sizes)
 
 
 def _with_routing_replay_flag(enabled: bool):
@@ -146,6 +182,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
             mesh_name="train",
             dp_rank=self.engine.get_data_parallel_rank(),
             is_collect=self.engine.is_mp_src_rank_with_outputs(),
+            is_mp_src=self.engine.is_mp_src_rank(),
         )
 
         if hasattr(self.model_config, "hf_config"):
@@ -484,7 +521,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             omega_profiler_config = config.ref.get("profiler", {})
 
         profiler_config = omega_conf_to_dataclass(omega_profiler_config, dataclass_type=ProfilerConfig)
-        if omega_profiler_config.get("tool", None) in ["npu", "nsys", "torch", "torch_memory", "precision_debugger"]:
+        # Any configured tool gets its tool_config converted, not just verl's built-in ones:
+        # omega_conf_to_dataclass returns None for a missing/empty config, so a tool without a
+        # tool_config entry still works, and a plugin-supplied tool can name its own dataclass
+        # through `_target_`.
+        if omega_profiler_config.get("tool", None) is not None:
             tool_config = omega_conf_to_dataclass(
                 omega_profiler_config.get("tool_config", {}).get(omega_profiler_config.get("tool"))
             )
@@ -537,6 +578,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model)
+        liger_capacity = _plan_liger_flsce_capacity(self.config, self.role)
 
         # 1. build reference model
         if "ref" in self.role:
@@ -582,6 +624,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.config.ref.ppo_micro_batch_size_per_gpu
             )
             ref_training_config.engine_config.use_remove_padding = model_config.get("use_remove_padding", False)
+            if isinstance(ref_training_config.engine_config, McoreEngineConfig):
+                ref_training_config.engine_config._liger_flsce_capacity = liger_capacity
 
             self.ref = self.ref_worker_cls(config=ref_training_config)
             self.ref.reset()
@@ -627,6 +671,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.config.actor.ppo_micro_batch_size_per_gpu
             )
             actor_training_config.engine_config.use_remove_padding = model_config.get("use_remove_padding", False)
+            if isinstance(actor_training_config.engine_config, McoreEngineConfig):
+                actor_training_config.engine_config._liger_flsce_capacity = liger_capacity
 
             if self.config.actor.use_dynamic_bsz:
                 assert self.config.rollout.log_prob_max_token_len_per_gpu is not None
@@ -638,11 +684,23 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.loss_fn = partial(
                     distillation_ppo_loss, config=actor_config, distillation_config=distillation_config
                 )
+            elif (actor_config.policy_loss.get("rollout_correction", None) or {}).get("score_centering", False):
+                self.loss_fn = partial(score_centering_ppo_loss, config=actor_config)
             else:
                 self.loss_fn = partial(ppo_loss, config=actor_config)
             self.actor = self.actor_worker_cls(config=actor_training_config)
             self.actor.reset()
             self.actor.set_loss_fn(self.loss_fn)
+            vllm_engine_kwargs = (self.config.rollout.get("engine_kwargs", {}) or {}).get("vllm", {}) or {}
+            # vLLM accepts hyphenated option names as well.
+            vllm_engine_kwargs = {str(key).replace("-", "_"): value for key, value in vllm_engine_kwargs.items()}
+            self.actor.engine.rollout_name = self.config.rollout.name
+            self.actor.engine.vllm_enable_moe_shared_loras = bool(
+                vllm_engine_kwargs.get("enable_moe_shared_loras", False)
+            )
+            self.actor.engine.vllm_enable_mixed_moe_lora_format = bool(
+                vllm_engine_kwargs.get("enable_mixed_moe_lora_format", False)
+            )
             self.set_dispatch_collect(mesh_name="actor", **self.actor.get_dispatch_collect())
 
         # 3. build rollout engine
@@ -672,6 +730,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.base_sync_done: bool = "dummy" not in self.config.rollout.load_format
             self.layered_summon = self.config.rollout.get("layered_summon", False)
             self.peft_merge: bool = model_config.lora.get("merge", False)
+            # resync_base only applies to an active, unmerged LoRA adapter.
+            lora_active = model_config.lora_rank > 0 or model_config.lora.get("rank", 0) > 0
+            self.lora_resync_base: bool = (
+                bool(model_config.lora.get("resync_base", False)) and lora_active and not self.peft_merge
+            )
 
         # 4. build checkpoint engine
         if "actor" in self.role:
@@ -685,6 +748,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.checkpoint_engine = CheckpointEngineRegistry.new(
                 backend, is_master=(torch.distributed.get_rank() == 0), bucket_size=bucket_size, **engine_kwargs
             )
+
+            engine_config = getattr(self.actor.engine, "engine_config", None)
+            overrides = getattr(engine_config, "override_transformer_config", None) or {}
+            weight_quantizer = dispatch_rollout_weight_quantizer(
+                model_config=model_config,
+                rollout_config=self.config.rollout,
+                qat_config=getattr(engine_config, "qat", None),
+                real_nvfp4_bf16_layers=bf16_layers_at_start_end(overrides) if real_nvfp4_enabled(overrides) else None,
+            )
+            if weight_quantizer is not None:
+                self.actor.engine.set_rollout_weight_quantizer(weight_quantizer)
 
         # Free cached GPU memory so colocated vLLM processes can see it via cudaMemGetInfo
         aggressive_empty_cache(force_sync=True)
@@ -724,6 +798,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.actor.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    @RLInsightLogger.trace_state_decorator(
+        "update_weight",
+        state_lane_id=lambda self: f"rank_{self.rank}",
+    )
     async def update_weights(self, global_steps: int = None, mode: str = "auto"):
         """Update weights from trainer to rollout.
 
@@ -753,19 +831,38 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # Resolve mode: "auto" falls back to config, explicit values take precedence
         effective_mode = mode if mode != "auto" else self.config.rollout.checkpoint_engine.backend
 
-        # 0. send_weights only for async training with disaggregated trainer and rollout
+        # 0. send_weights for disaggregated or vLLM-native checkpoint engines
         if effective_mode != "naive":
-            if effective_mode == "delta_sharded":
-                # the delta engine owns the sync state machine (seed vs steady,
-                # snapshot prime), so it drives the training engine itself.
-                metrics = await self.checkpoint_engine.send_weights(self.actor.engine, global_steps=global_steps)
-                return metrics or {}
-            per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
-            metrics = await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
+            if getattr(self, "lora_resync_base", False):
+                raise ValueError(
+                    f"model.lora.resync_base needs the naive weight sync, got {effective_mode!r}: other modes never "
+                    "re-send the LoRA adapter, so discarding the rollout weights on sleep would lose it."
+                )
+            is_colocated = bool(getattr(self.checkpoint_engine, "is_colocated", False))
+            if is_colocated:
+                set_expandable_segments(False)
+                get_torch_device().empty_cache()
+            try:
+                if getattr(self.checkpoint_engine, "requires_engine", False) or effective_mode == "delta_sharded":
+                    # engines owning the sync state machine or vLLM WeightSource drive the training engine directly.
+                    metrics = await self.checkpoint_engine.send_weights(self.actor.engine, global_steps=global_steps)
+                else:
+                    per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
+                    metrics = await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
+                if self.actor.engine.is_param_offload_enabled:
+                    self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
+                if is_colocated:
+                    get_torch_device().synchronize()
+                    get_torch_device().empty_cache()
+                    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+                        await asyncio.to_thread(torch.distributed.barrier)
+            finally:
+                if is_colocated:
+                    set_expandable_segments(True)
             return metrics or {}
 
         set_expandable_segments(False)
-        aggressive_empty_cache(force_sync=True)
+        get_torch_device().empty_cache()
         log_gpu_memory_usage("Before resume weights", logger=logger)
 
         # 1. resume rollout memory (weights were released during sleep)
@@ -786,13 +883,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             layered_summon=self.layered_summon, base_sync_done=True
         )
 
-        do_lora_base_sync = False
-        if not self.peft_merge and peft_config is not None:
-            self.rollout.sleep_level = 1
-            do_lora_base_sync = not self.base_sync_done
+        do_lora_base_sync = (
+            not self.peft_merge and peft_config is not None and (self.lora_resync_base or not self.base_sync_done)
+        )
 
         # 3. sync weights: For SGLang, we need base first (when needed), then adapter/merged
         if do_lora_base_sync:
+            # The FSDP exporter rejects layered_summon for a base export; Megatron ignores the flag.
             per_tensor_param_base, _base_peft_config = self.actor.engine.get_per_tensor_param(
                 layered_summon=self.layered_summon, base_sync_done=False
             )
@@ -809,10 +906,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # 3. offload model to cpu
         if self.actor.engine.is_param_offload_enabled:
             self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
-        aggressive_empty_cache(force_sync=True)
+        get_torch_device().synchronize()
+        get_torch_device().empty_cache()
+        log_gpu_memory_usage("After offload model to cpu", logger=logger)
 
         # 4. resume kv_cache
         if self.config.rollout.free_cache_engine:
+            # All trainer ranks enter this naive sync path via ONE_TO_ALL. Wait for
+            # their offload and device cleanup before a leader wakes the rollout
+            # workers; local device synchronization alone cannot prevent OOM on peers.
+            await asyncio.to_thread(torch.distributed.barrier)
             await self.rollout.resume(tags=["kv_cache"])
         log_gpu_memory_usage("After resume kv_cache", logger=logger)
 

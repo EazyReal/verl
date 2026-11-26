@@ -16,14 +16,16 @@ A unified tracking interface that supports logging data to different backend
 """
 
 import dataclasses
+import inspect
 import json
 import logging
 import os
 from contextlib import contextmanager
 from enum import Enum
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, Callable
 
 import orjson
 from packaging.version import Version
@@ -209,6 +211,8 @@ class Tracking:
             loggers["tensorboard"].finish()
         if "clearml" in loggers:
             loggers["clearml"].finish()
+        if "mlflow" in loggers:
+            loggers["mlflow"].finish()
         if "trackio" in loggers:
             loggers["trackio"].finish()
         if "file" in loggers:
@@ -224,9 +228,11 @@ class RLInsightLogger:
     """Logger backend that exports scalar metrics and rl-insight runtime signals."""
 
     ENABLE_ENV = "VERL_RL_INSIGHT_ENABLE"
+    MINIMUM_RL_INSIGHT_VERSION = Version("0.3.0")
     _init_done = False
     _rl_insight_module = None
     _registered_metrics: set[tuple[str | None, tuple[str, ...], str | None]] = set()
+    _warned_unsupported_features: set[str] = set()
 
     def __init__(self, project_name, experiment_name, config=None):
         self.init(project_name=project_name, experiment_name=experiment_name, config=config)
@@ -243,6 +249,23 @@ class RLInsightLogger:
     def enabled(cls) -> bool:
         """Return whether rl-insight is globally enabled in this process."""
         return os.getenv(cls.ENABLE_ENV) == "1"
+
+    @classmethod
+    def _warn_unsupported_rl_insight(cls, feature: str) -> None:
+        """Warn once when an optional RL-Insight feature is unavailable."""
+        if feature in cls._warned_unsupported_features:
+            return
+        cls._warned_unsupported_features.add(feature)
+        logger.warning(
+            "RL-Insight does not support %s (requires >= %s); monitoring is disabled for this feature",
+            feature,
+            cls.MINIMUM_RL_INSIGHT_VERSION,
+        )
+
+    @classmethod
+    def _rl_insight_version(cls) -> Version:
+        module = cls._get_rl_insight()
+        return Version(getattr(module, "__version__", "0"))
 
     @classmethod
     def init(cls, project_name=None, experiment_name=None, config=None):
@@ -264,17 +287,22 @@ class RLInsightLogger:
     def log(cls, data, step):
         if not cls.enabled():
             return
-        if not cls._init_done:
-            cls._get_rl_insight().init()
-            cls._init_done = True
-        metric_gauge = cls._get_rl_insight().metric_gauge
+        cls._ensure_rl_insight_init()
+        module = cls._get_rl_insight()
+        # Present on current main, but not in the released 0.3.0 package.
+        metric_log = getattr(module, "metric_log", None)
+        if not callable(metric_log):
+            metric_log = None
 
         for key, value in data.items():
             try:
                 scalar = float(value)
             except (TypeError, ValueError):
                 continue
-            metric_gauge(str(key).replace("/", "_"), scalar)
+            if metric_log is not None:
+                metric_log(str(key), scalar, step=int(step))
+            else:
+                module.metric_gauge(str(key).replace("/", "_"), scalar)
 
     @classmethod
     def finish(cls):
@@ -298,11 +326,127 @@ class RLInsightLogger:
             yield
             return
 
+        cls._ensure_rl_insight_init()
+        with cls._get_rl_insight().trace_state(state_name, state_lane_id=state_lane_id, **labels):
+            yield
+
+    @classmethod
+    def trace_state_decorator(
+        cls,
+        state_name: str,
+        *,
+        state_lane_id: str | int | Callable[[Any], str | int | None] | None = None,
+    ):
+        """Decorate an async instance method with an RL-Insight state trace."""
+
+        def decorator(method):
+            if not inspect.iscoroutinefunction(method):
+                raise TypeError("trace_state_decorator can only decorate async methods")
+
+            @wraps(method)
+            async def wrapped(self, *args, **kwargs):
+                if not cls.enabled():
+                    return await method(self, *args, **kwargs)
+
+                lane_id = state_lane_id(self) if callable(state_lane_id) else state_lane_id
+                with cls.trace_state(state_name, state_lane_id=lane_id):
+                    return await method(self, *args, **kwargs)
+
+            return wrapped
+
+        return decorator
+
+    @classmethod
+    def trace_span(
+        cls,
+        name: str,
+        *,
+        start_time_ns: int,
+        end_time_ns: int,
+        attributes: dict[str, Any] | None = None,
+    ) -> None:
+        """Report one completed span through rl-insight's direct trace API."""
+        if not cls.enabled():
+            return
+
+        module = cls._get_rl_insight()
+        if cls._rl_insight_version() < cls.MINIMUM_RL_INSIGHT_VERSION or not callable(
+            getattr(module, "trace_span", None)
+        ):
+            cls._warn_unsupported_rl_insight("trace_span")
+            return
+        cls._ensure_rl_insight_init()
+        cls._get_rl_insight().trace_span(
+            name=name,
+            start_time_ns=start_time_ns,
+            end_time_ns=end_time_ns,
+            attributes=dict(attributes or {}),
+        )
+
+    @classmethod
+    def _ensure_rl_insight_init(cls) -> None:
         if not cls._init_done:
             cls._get_rl_insight().init()
             cls._init_done = True
-        with cls._get_rl_insight().trace_state(state_name, state_lane_id=state_lane_id, **labels):
-            yield
+
+    @classmethod
+    def agent_loop_session(
+        cls,
+        *,
+        experiment_name: Any | None = None,
+        sample: Any,
+        session: Any,
+        traj: Any = 0,
+        uid: Any = None,
+        global_steps: Any = None,
+        session_id: Any = None,
+    ):
+        """Return the shared agent-loop session trace state."""
+        from verl.utils.rollout_trace import RolloutTraceConfig
+
+        rollout_config = RolloutTraceConfig.get_instance()
+        project_name = rollout_config.project_name
+        if experiment_name is None:
+            experiment_name = rollout_config.experiment_name or "default"
+
+        def fallback_session():
+            return SimpleNamespace(
+                identity={
+                    "project": project_name or "default",
+                    "experiment_name": experiment_name,
+                    "sample": str(sample),
+                    "session": str(session),
+                    "traj": str(traj),
+                    "state_lane_id": f"experiment={experiment_name}/sample={sample}/session={session}/traj={traj}",
+                    "uid": uid or "",
+                    "global_steps": global_steps if global_steps is not None else "",
+                    "session_id": session_id or "",
+                },
+                finish=lambda **kwargs: None,
+            )
+
+        if cls.enabled() and cls._rl_insight_version() < cls.MINIMUM_RL_INSIGHT_VERSION:
+            cls._warn_unsupported_rl_insight("agent_loop_session")
+            return fallback_session()
+        if cls.enabled() and not cls._init_done:
+            cls.init(project_name=project_name, experiment_name=experiment_name)
+
+        try:
+            from rl_insight.agent_loop import agent_loop_session
+        except ImportError:
+            cls._warn_unsupported_rl_insight("agent_loop_session")
+            return fallback_session()
+
+        return agent_loop_session(
+            project=project_name,
+            experiment_name=experiment_name,
+            sample=sample,
+            session=session,
+            traj=traj,
+            uid=uid,
+            global_steps=global_steps,
+            session_id=session_id,
+        )
 
     @classmethod
     def register_rollout_metrics(
@@ -507,6 +651,12 @@ class _MlflowLoggingAdapter:
                     self.logger.info(msg, *args)
                 else:
                     self.logger.warning(msg, *args)
+
+    def finish(self):
+        import mlflow
+
+        if mlflow.active_run() is not None:
+            mlflow.end_run()
 
 
 def _compute_mlflow_params_from_objects(params) -> dict[str, Any]:

@@ -444,6 +444,26 @@ def test_dataproto_pad_unpad():
     assert unpadd_data.meta_info == {"info": "test_info"}
 
 
+def test_dataproto_padding():
+    obs = torch.tensor([[1, 2], [3, 4], [5, 6]])
+    labels = ["a", "b", "c"]
+    data = DataProto.from_dict(tensors={"obs": obs}, non_tensors={"labels": labels}, meta_info={"info": "test_info"})
+
+    data.padding(padding_size=0)
+    assert torch.all(torch.eq(data.batch["obs"], obs))
+    assert (data.non_tensor_batch["labels"] == labels).all()
+
+    data.padding(padding_size=2)
+    assert torch.all(torch.eq(data.batch["obs"], torch.tensor([[1, 2], [3, 4], [5, 6], [5, 6], [5, 6]])))
+    assert (data.non_tensor_batch["labels"] == ["a", "b", "c", "c", "c"]).all()
+    assert data.meta_info == {"info": "test_info"}
+
+    data = DataProto.from_dict(tensors={"obs": obs}, non_tensors={"labels": labels}, meta_info={"info": "test_info"})
+    data.padding(padding_size=2, padding_candidate="first")
+    assert torch.all(torch.eq(data.batch["obs"], torch.tensor([[1, 2], [3, 4], [5, 6], [1, 2], [1, 2]])))
+    assert (data.non_tensor_batch["labels"] == ["a", "b", "c", "a", "a"]).all()
+
+
 def test_dataproto_fold_unfold():
     from verl.protocol import DataProto, fold_batch_dim, unfold_batch_dim
 
@@ -577,7 +597,7 @@ def test_old_vs_new_from_single_dict():
         """Mimics the *old* from_single_dict (always returns a DataProto)."""
 
         @classmethod
-        def from_single_dict(cls, data, meta_info=None, auto_padding=False):
+        def from_single_dict(cls, data, meta_info=None):
             tensors, non_tensors = {}, {}
             for k, v in data.items():
                 if torch.is_tensor(v):
@@ -589,7 +609,6 @@ def test_old_vs_new_from_single_dict():
                 tensors=tensors,
                 non_tensors=non_tensors,
                 meta_info=meta_info,
-                auto_padding=auto_padding,
             )
 
     sample = {"x": torch.tensor([0])}
@@ -1203,6 +1222,30 @@ def test_serialize_deserialize_tensordict_with_device():
         assert torch.allclose(original_tensor.cpu(), reconstructed_tensor.cpu())
         assert original_tensor.shape == reconstructed_tensor.shape
         assert original_tensor.dtype == reconstructed_tensor.dtype
+
+
+def test_numpy_dataproto_serialization_skips_tensordict_consolidation(monkeypatch):
+    """NumPy serialization should not allocate an unused consolidated TensorDict."""
+    monkeypatch.setenv("VERL_DATAPROTO_SERIALIZATION_METHOD", "numpy")
+
+    data = DataProto.from_dict(
+        tensors={"obs": torch.arange(12).reshape(3, 4)},
+        non_tensors={"labels": np.array(["a", "b", "c"], dtype=object)},
+        meta_info={"step": 1},
+    )
+
+    def fail_on_consolidate(*args, **kwargs):
+        pytest.fail("TensorDict.consolidate() should not be called in NumPy serialization mode")
+
+    monkeypatch.setattr(TensorDict, "consolidate", fail_on_consolidate)
+
+    state = data.__getstate__()
+    restored = DataProto()
+    restored.__setstate__(state)
+
+    torch.testing.assert_close(restored.batch["obs"], data.batch["obs"])
+    assert restored.non_tensor_batch["labels"].tolist() == ["a", "b", "c"]
+    assert restored.meta_info == {"step": 1}
 
 
 def test_serialize_dataproto_with_empty_tensordict():

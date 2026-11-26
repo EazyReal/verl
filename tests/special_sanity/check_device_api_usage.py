@@ -32,13 +32,12 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "verl/plugin/platform/platform_manager.py",  # platform auto-detection probes torch.cuda
     "verl/utils/profiler/nvtx_profile.py",  # appear in NsightSystemsProfiler
     "verl/utils/profiler/torch_profile.py",  # appear in TorchProfiler
+    "verl/utils/profiler/torch_memory_profile.py",  # explicitly limit OOM observers to CUDA/NPU
     "verl/utils/profiler/config.py",  # appear in TorchProfilerToolConfig
     "verl/utils/kernel/linear_cross_entropy.py",  # appear in nvidia nvtx
     "verl/utils/rendezvous/ray_backend.py",  # appear in cupy importance
     "verl/single_controller/ray/base.py",  # appear in default device_name
-    "verl/trainer/ppo/ray_trainer.py",  # appear in default device_name
     "verl/experimental/transfer_queue/ray_trainer.py",  # appear in docstring as default device_name
-    "verl/experimental/one_step_off_policy/ray_trainer.py",  # appear in docstring as default device_name
     "verl/utils/reward_score/sandbox_fusion/utils.py",  # appear in sandbox language type
     "verl/third_party/torch/distributed/_state_dict_utils.py",  # torch monkey patch fixes
     "verl/third_party/torch/distributed/checkpoint/state_dict.py",  # torch monkey patch fixes
@@ -55,7 +54,6 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "verl/workers/rollout/trtllm_rollout/trtllm_async_server.py",  # appear in config.cudagraph_capture_sizes
     "verl/workers/rollout/replica.py",  # appear in default device_name
     "verl/checkpoint_engine",  # checkpoint engine backend are device specific
-    "verl/utils/modelopt/megatron_qat_patch.py",  # appear in torch.cuda.empty_cache()
     "verl/models/mcore/patch.py",  # checkpoint patch only on cuda
 ]
 

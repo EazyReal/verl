@@ -48,29 +48,6 @@ with contextlib.suppress(Exception):
         tensordict.set_list_to_stack(True).set()
 
 
-class _DataProtoConfigMeta(type):
-    _config = {}
-
-    auto_padding_key = "_verl_auto_padding"
-
-    @property
-    def auto_padding(cls):
-        enabled_by_env = os.getenv("VERL_AUTO_PADDING", "FALSE").upper() in ["TRUE", "1"]
-        return enabled_by_env or cls._config.get(cls.auto_padding_key, False)
-
-    @auto_padding.setter
-    def auto_padding(cls, enabled: bool):
-        assert isinstance(enabled, bool), f"enabled must be a boolean, got {enabled} as {type(enabled)}"
-        cls._config[cls.auto_padding_key] = enabled
-
-
-class DataProtoConfig(metaclass=_DataProtoConfigMeta):
-    pass
-
-
-_padding_size_key = "_padding_size_key_x123d"
-
-
 def pad_dataproto_to_divisor(data: "DataProto", size_divisor: int):
     """Pad a DataProto to size divisible by size_divisor
 
@@ -375,25 +352,22 @@ class DataProto:
             raise TypeError(f"Indexing with {type(item)} is not supported")
 
     def __getstate__(self):
-        if version.parse(tensordict.__version__) >= version.parse("0.5.0") and self.batch is not None:
-            # Check if batch is empty to avoid torch.cat error in consolidate
-            if len(self.batch.keys()) > 0:
-                batch = self.batch.contiguous().consolidate()
-            else:
-                batch = self.batch
-        else:
-            batch = self.batch
-
         if os.getenv("VERL_DATAPROTO_SERIALIZATION_METHOD") == "numpy":
-            if batch is not None:
-                batch = serialize_tensordict(self.batch)
-
             return (
-                batch,
+                serialize_tensordict(self.batch) if self.batch is not None else None,
                 self.non_tensor_batch,
                 self.meta_info,
             )
         else:
+            if version.parse(tensordict.__version__) >= version.parse("0.5.0") and self.batch is not None:
+                # Check if batch is empty to avoid torch.cat error in consolidate
+                if len(self.batch.keys()) > 0:
+                    batch = self.batch.contiguous().consolidate()
+                else:
+                    batch = self.batch
+            else:
+                batch = self.batch
+
             import io
 
             buffer = io.BytesIO()
@@ -477,7 +451,7 @@ class DataProto:
                 )
 
     @classmethod
-    def from_single_dict(cls, data: dict[str, torch.Tensor | np.ndarray], meta_info=None, auto_padding=False):
+    def from_single_dict(cls, data: dict[str, torch.Tensor | np.ndarray], meta_info=None):
         """Create a DataProto from a dict of tensors and non_tensors"""
         tensors = {}
         non_tensors = {}
@@ -490,7 +464,7 @@ class DataProto:
             else:
                 raise ValueError(f"Unsupported type in data {type(val)}")
 
-        return cls.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=meta_info, auto_padding=auto_padding)
+        return cls.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=meta_info)
 
     @classmethod
     def from_dict(
@@ -499,7 +473,6 @@ class DataProto:
         non_tensors=None,
         meta_info=None,
         num_batch_dims=1,
-        auto_padding=False,
     ):
         """Create a DataProto from a dict of tensors. This assumes that
         1. All the tensor in tensors have the same dim0
@@ -538,8 +511,6 @@ class DataProto:
                 non_tensors[key] = np.array(val, dtype=object)
 
         tensor_dict = TensorDict(source=tensors, batch_size=batch_size) if tensors else None
-        if auto_padding:
-            meta_info[DataProtoConfig.auto_padding_key] = True
         return cls(batch=tensor_dict, non_tensor_batch=non_tensors, meta_info=meta_info)
 
     @classmethod
@@ -837,15 +808,6 @@ class DataProto:
 
         return iter(get_data())
 
-    def is_padding_enabled(self):
-        """
-        Check if padding is enabled for the DataProto.
-        Returns:
-            bool: True if padding is enabled, False otherwise.
-        """
-        dataproto_specific_padding = self.meta_info.get(DataProtoConfig.auto_padding_key, False)
-        return dataproto_specific_padding or DataProtoConfig.auto_padding
-
     def padding(self, padding_size, padding_candidate=""):
         """Pad the DataProto by concating with padding_candidate.repeat(padding_size)
 
@@ -870,10 +832,9 @@ class DataProto:
         Returns:
             List[DataProto]: a list of DataProto after splitting
         """
-        if not self.is_padding_enabled():
-            assert len(self) % chunks == 0, (
-                f"only support equal chunk. Got size of DataProto {len(self)} and chunk {chunks}."
-            )
+        assert len(self) % chunks == 0, (
+            f"only support equal chunk. Got size of DataProto {len(self)} and chunk {chunks}."
+        )
 
         bsz_in_batch = None
         if self.batch is not None:

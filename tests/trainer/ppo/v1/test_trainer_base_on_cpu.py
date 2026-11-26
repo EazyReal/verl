@@ -12,12 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import patch
+import math
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
+import pytest
 from omegaconf import OmegaConf
 
 from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer, ReplayBufferAsync
-from verl.trainer.ppo.v1.trainer_base import PPOTrainer
+from verl.trainer.ppo.v1.trainer_base import PPOTrainer, apply_greedy_sampling_params
+
+
+def test_greedy_reward_baseline_does_not_request_score_centering_heads():
+    params = {"top_p": 0.9, "top_k": 64, "temperature": 1.0, "topk_log_probs": 128, "logprobs": True}
+    apply_greedy_sampling_params(params)
+    assert params == {"top_p": 1.0, "top_k": -1, "temperature": 0, "logprobs": True}
 
 
 class _StubTrainer(PPOTrainer):
@@ -90,6 +99,85 @@ def test_custom_sampler_skips_builtin_filter_groups_validation():
     assert "sync_refill_failed_groups" not in sampler.kwargs
 
 
+@pytest.mark.parametrize("trainer_mode", ["sync", "colocate_async", "separate_async"])
+def test_builtin_sampler_poll_interval_defaults_to_two_seconds(trainer_mode):
+    sampler = _trainer_with_filter_groups({"enable": False}, trainer_mode=trainer_mode)._build_replay_buffer()
+
+    assert sampler.poll_interval == 2.0
+
+
+@pytest.mark.parametrize("trainer_mode", ["sync", "colocate_async", "separate_async"])
+def test_builtin_sampler_uses_configured_poll_interval(trainer_mode):
+    trainer = _trainer_with_filter_groups({"enable": False}, trainer_mode=trainer_mode)
+    trainer.config.trainer.v1.sampler.poll_interval = 0.1
+
+    assert trainer._build_replay_buffer().poll_interval == 0.1
+
+
+@pytest.mark.parametrize("trainer_mode", ["sync", "separate_async"])
+@pytest.mark.parametrize(
+    "poll_interval", [0, 0.0, -1.0, -math.inf, math.inf, math.nan, "inf", "nan"], ids=lambda v: f"{v!r}"
+)
+def test_builtin_sampler_rejects_invalid_poll_interval(poll_interval, trainer_mode):
+    """0, negative, infinite and nan intervals fail before the replay buffer is constructed."""
+    trainer = _trainer_with_filter_groups({"enable": False}, trainer_mode=trainer_mode)
+    trainer.config.trainer.v1.sampler.poll_interval = poll_interval
+    buffer_cls = "ReplayBuffer" if trainer_mode == "sync" else "ReplayBufferAsync"
+
+    with (
+        patch(f"verl.trainer.ppo.v1.trainer_base.{buffer_cls}") as constructor,
+        pytest.raises(ValueError, match=r"poll_interval must be a finite number of seconds > 0"),
+    ):
+        trainer._build_replay_buffer()
+
+    constructor.assert_not_called()
+
+
+@pytest.mark.parametrize("poll_interval", [1e-3, 0.5, 30, "0.25"], ids=lambda v: f"{v!r}")
+def test_builtin_sampler_accepts_finite_positive_poll_interval(poll_interval):
+    trainer = _trainer_with_filter_groups({"enable": False}, trainer_mode="separate_async")
+    trainer.config.trainer.v1.sampler.poll_interval = poll_interval
+
+    sampler = trainer._build_replay_buffer()
+
+    assert type(sampler) is ReplayBufferAsync
+    assert sampler.poll_interval == float(poll_interval)
+    assert isinstance(sampler.poll_interval, float)
+
+
+def test_custom_sampler_does_not_receive_poll_interval():
+    trainer = _trainer_with_filter_groups({"enable": False})
+    trainer.config.trainer.v1.sampler.custom_sampler = {"path": "custom.py", "name": "CustomSampler"}
+    trainer.config.trainer.v1.sampler.poll_interval = 0.1
+
+    with patch("verl.trainer.ppo.v1.trainer_base.load_extern_type", return_value=_CustomSampler):
+        sampler = trainer._build_replay_buffer()
+
+    assert "poll_interval" not in sampler.kwargs
+
+
+def test_configured_poll_interval_matches_a_custom_subclass_that_sets_it():
+    """poll_interval=0.1 builds the same async replay buffer as a ReplayBufferAsync subclass passing 0.1."""
+
+    class _FastPollReplayBufferAsync(ReplayBufferAsync):
+        def __init__(self, *args, poll_interval: float = 0.1, **kwargs):
+            super().__init__(*args, poll_interval=poll_interval, **kwargs)
+
+    configured = _trainer_with_filter_groups({"enable": False}, trainer_mode="separate_async")
+    configured.config.trainer.v1.sampler.poll_interval = 0.1
+    custom = _trainer_with_filter_groups({"enable": False}, trainer_mode="separate_async")
+    custom.config.trainer.v1.sampler.custom_sampler = {"path": "custom.py", "name": "FastPoll"}
+
+    built_in = configured._build_replay_buffer()
+    with patch("verl.trainer.ppo.v1.trainer_base.load_extern_type", return_value=_FastPollReplayBufferAsync):
+        subclass = custom._build_replay_buffer()
+
+    assert type(built_in) is ReplayBufferAsync
+    assert built_in.poll_interval == subclass.poll_interval == 0.1
+    state = {k: v for k, v in vars(built_in).items() if k != "refill_fn"}
+    assert state == {k: v for k, v in vars(subclass).items() if k != "refill_fn"}
+
+
 def test_builtin_filter_groups_uses_default_inflight_limit():
     trainer = _trainer_with_filter_groups({"enable": True, "metric": "acc"})
 
@@ -143,7 +231,7 @@ def test_sync_failure_refill_overrides_dataloader_generation_batch_size():
         patch("verl.trainer.ppo.v1.trainer_base.create_rl_dataset", side_effect=[[{}, {}], [{}]]),
         patch("verl.trainer.ppo.v1.trainer_base.create_rl_sampler", return_value=None),
         patch("verl.trainer.ppo.v1.trainer_base.StatefulDataLoader") as dataloader,
-        patch("verl.trainer.ppo.v1.trainer_base.logger.warning") as warning,
+        patch("verl.utils.dataset.dataloader.logger.warning") as warning,
     ):
         trainer._init_dataloader()
 
@@ -163,3 +251,31 @@ def test_builtin_filter_groups_warns_when_total_generation_limit_is_configured()
         "use max_inflight_gen_batches to bound concurrent Sync DAPO generation.",
         10,
     )
+
+
+@pytest.mark.parametrize("score_centering", [True, False])
+def test_update_actor_passes_score_centering_flag(score_centering):
+    trainer = _StubTrainer.__new__(_StubTrainer)
+    trainer.config = OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "actor": {
+                    "ppo_mini_batch_size": 2,
+                    "calculate_entropy": False,
+                    "entropy_coeff": 0.0,
+                    "ppo_epochs": 1,
+                    "data_loader_seed": 1,
+                    "shuffle": False,
+                    "policy_loss": {"rollout_correction": {"score_centering": score_centering}},
+                },
+                "rollout": {"n": 4, "temperature": 1.0},
+            }
+        }
+    )
+    trainer.actor_rollout_wg = MagicMock()
+    trainer.actor_rollout_wg.update_actor.return_value = {"metrics": {"mfu": 0.0}}
+    batch = SimpleNamespace(extra_info={})
+
+    trainer._update_actor(batch, {})
+
+    assert batch.extra_info["score_centering"] is score_centering
